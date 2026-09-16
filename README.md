@@ -22,6 +22,18 @@ This demo uses one B2C registration for both the Android client and its own API.
 
 The exchange endpoint must verify the B2C access token. The app validates the response fields but does not display or log either returned token.
 
+## Firebase generic OIDC mode
+
+Firebase OIDC requires **Authentication with Identity Platform**. In Firebase project `intouchtestapp`, add an OpenID Connect provider with provider ID `oidc.nzski-b2c`, client ID `fe6f796c-d75a-405b-b7e9-9d0013866617`, and issuer `https://intouchelevateb2c.b2clogin.com/intouchelevateb2c.onmicrosoft.com/b2c_1a_uat_signup_signin/v2.0`. Prefer authorization code flow; store its client secret only in Firebase Console, never in this Android project. The provider must return the B2C access token because the exchange API consumes it.
+
+Add this web redirect URI to `NZSki-B2C-Intergration-App` in the B2C tenant:
+
+```text
+https://intouchtestapp.firebaseapp.com/__/auth/handler
+```
+
+The app requests scope `fe6f796c-d75a-405b-b7e9-9d0013866617`, which is the existing same-registration B2C resource scope. If the Firebase provider ID differs, update `firebase.oidcProviderId` in `local.properties`.
+
 ## Build
 
 ```powershell

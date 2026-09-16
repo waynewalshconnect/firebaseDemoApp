@@ -16,7 +16,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.lightColorScheme
@@ -31,6 +35,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.google.firebase.auth.AuthResult
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.auth.FirebaseAuthWebException
+import com.google.firebase.auth.OAuthCredential
+import com.google.firebase.auth.OAuthProvider
 import com.microsoft.identity.client.AuthenticationCallback
 import com.microsoft.identity.client.IAuthenticationResult
 import com.microsoft.identity.client.IPublicClientApplication
@@ -46,6 +56,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 private enum class FlowStep { B2C, EXCHANGE, PROFILE }
+private enum class AuthMode(val label: String) { MSAL("MSAL"), FIREBASE_OIDC("Firebase OIDC") }
 
 private data class UserProfile(
     val guestId: String,
@@ -66,15 +77,34 @@ private data class AppState(
 
 class MainActivity : ComponentActivity() {
     private var state by mutableStateOf(AppState())
+    private var authMode by mutableStateOf(AuthMode.MSAL)
     private var b2cApplication: ISingleAccountPublicClientApplication? = null
+    private val firebaseAuth by lazy { FirebaseAuth.getInstance() }
     private var b2cAccessToken: String? = null
     private var elevateAccessToken: String? = null
     private var b2cProfile: UserProfile? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { DemoApp(state, ::signIn, ::exchangeToken, ::loadProfile, ::signOut) }
+        val pendingFirebaseSignIn = firebaseAuth.pendingAuthResult
+        if (pendingFirebaseSignIn != null) authMode = AuthMode.FIREBASE_OIDC
+        setContent {
+            DemoApp(
+                state,
+                authMode,
+                ::selectAuthMode,
+                ::signIn,
+                ::exchangeToken,
+                ::loadProfile,
+                ::signOut,
+            )
+        }
         initializeB2c()
+        pendingFirebaseSignIn?.let(::observeFirebaseSignIn)
+    }
+
+    private fun selectAuthMode(mode: AuthMode) {
+        if (state.activeStep == null && !state.b2cComplete) authMode = mode
     }
 
     private fun initializeB2c() {
@@ -89,7 +119,9 @@ class MainActivity : ComponentActivity() {
             object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
                 override fun onCreated(application: ISingleAccountPublicClientApplication) {
                     b2cApplication = application
-                    state = AppState()
+                    if (authMode == AuthMode.MSAL && state.activeStep == null && !state.b2cComplete) {
+                        state = AppState()
+                    }
                 }
 
                 override fun onError(exception: MsalException) {
@@ -104,6 +136,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun signIn() {
+        when (authMode) {
+            AuthMode.MSAL -> signInWithMsal()
+            AuthMode.FIREBASE_OIDC -> signInWithFirebaseOidc()
+        }
+    }
+
+    private fun signInWithMsal() {
         val application = b2cApplication ?: return
         val scopes = BuildConfig.B2C_SCOPES.split(',', ' ').filter(String::isNotBlank)
         if (scopes.isEmpty() || BuildConfig.TOKEN_EXCHANGE_URL.isBlank() || BuildConfig.USER_PROFILE_URL.isBlank()) {
@@ -143,6 +182,56 @@ class MainActivity : ComponentActivity() {
                 })
                 .build(),
         )
+    }
+
+    private fun signInWithFirebaseOidc() {
+        if (BuildConfig.FIREBASE_OIDC_PROVIDER_ID.isBlank()) {
+            state = AppState(message = "Add the Firebase OIDC provider ID to local.properties", failedStep = FlowStep.B2C)
+            return
+        }
+        val scopes = BuildConfig.B2C_SCOPES.split(',', ' ').filter(String::isNotBlank)
+        val provider = OAuthProvider.newBuilder(BuildConfig.FIREBASE_OIDC_PROVIDER_ID).apply {
+            this.scopes = scopes
+        }.build()
+        state = AppState(message = "Signing in through Firebase OIDC", activeStep = FlowStep.B2C)
+        observeFirebaseSignIn(firebaseAuth.startActivityForSignInWithProvider(this, provider))
+    }
+
+    private fun observeFirebaseSignIn(task: com.google.android.gms.tasks.Task<AuthResult>) {
+        task.addOnSuccessListener(::completeFirebaseSignIn)
+            .addOnFailureListener { error ->
+                val message = when {
+                    error is FirebaseAuthWebException && error.errorCode == "ERROR_WEB_CONTEXT_CANCELED" ->
+                        "Firebase OIDC sign-in was cancelled"
+                    error.message?.contains("CONFIGURATION_NOT_FOUND") == true ->
+                        "Firebase Authentication or provider ${BuildConfig.FIREBASE_OIDC_PROVIDER_ID} is not configured in intouchtestapp"
+                    error is FirebaseAuthException ->
+                        "${error.errorCode}: ${error.message ?: "Firebase OIDC authentication failed"}"
+                    else -> error.message ?: "Firebase OIDC authentication failed"
+                }
+                state = AppState(
+                    message = message,
+                    failedStep = FlowStep.B2C,
+                )
+            }
+    }
+
+    private fun completeFirebaseSignIn(result: AuthResult) {
+        val credential = result.credential as? OAuthCredential
+        val accessToken = credential?.accessToken
+        if (accessToken.isNullOrBlank()) {
+            state = AppState(
+                message = "Firebase OIDC returned no B2C access token",
+                failedStep = FlowStep.B2C,
+            )
+            return
+        }
+        val user = result.user
+        val claims = result.additionalUserInfo?.profile.orEmpty()
+        b2cAccessToken = accessToken
+        elevateAccessToken = null
+        b2cProfile = userProfileFromClaims(claims, user?.email ?: user?.displayName)
+        state = AppState(message = "Firebase OIDC authentication complete", b2cComplete = true)
     }
 
     private fun exchangeToken() {
@@ -202,6 +291,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun signOut() {
+        firebaseAuth.signOut()
+        if (authMode == AuthMode.FIREBASE_OIDC) {
+            b2cAccessToken = null
+            elevateAccessToken = null
+            b2cProfile = null
+            state = AppState(message = "Signed out")
+            return
+        }
         b2cApplication?.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
             override fun onSignOut() {
                 b2cAccessToken = null
@@ -301,9 +398,12 @@ private object UserProfileClient {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DemoApp(
     state: AppState,
+    authMode: AuthMode,
+    onAuthModeSelected: (AuthMode) -> Unit,
     onSignIn: () -> Unit,
     onExchangeToken: () -> Unit,
     onLoadProfile: () -> Unit,
@@ -327,6 +427,19 @@ private fun DemoApp(
                     Spacer(Modifier.height(16.dp))
                     Text("B2C to Elevate", fontWeight = FontWeight.Bold, fontSize = 34.sp, letterSpacing = 0.sp)
                     Text("Secure token exchange demo", color = Color(0xFF58635F), fontSize = 18.sp)
+                    Spacer(Modifier.height(20.dp))
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        AuthMode.entries.forEachIndexed { index, mode ->
+                            SegmentedButton(
+                                selected = authMode == mode,
+                                onClick = { onAuthModeSelected(mode) },
+                                enabled = !busy && !state.b2cComplete,
+                                shape = SegmentedButtonDefaults.itemShape(index, AuthMode.entries.size),
+                            ) {
+                                Text(mode.label)
+                            }
+                        }
+                    }
                 }
 
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -360,7 +473,7 @@ private fun DemoApp(
                         else -> "Ready to exchange token"
                     }
 
-                    StepRow("1", "Microsoft Entra B2C", b2cStatus, state.b2cComplete || state.activeStep == FlowStep.B2C, !busy, onSignIn)
+                    StepRow("1", "B2C via ${authMode.label}", b2cStatus, state.b2cComplete || state.activeStep == FlowStep.B2C, !busy, onSignIn)
                     StepRow("2", "Current user profile", profileStatus, state.profile != null || state.activeStep == FlowStep.PROFILE, state.b2cComplete && !busy, onLoadProfile)
                     StepRow("3", "Elevate token exchange", exchangeStatus, state.exchangeComplete || state.activeStep == FlowStep.EXCHANGE, state.b2cComplete && !busy, onExchangeToken)
                     Spacer(Modifier.height(24.dp))
