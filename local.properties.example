@@ -1,0 +1,9 @@
+sdk.dir=C:\\Users\\YOUR_USER\\AppData\\Local\\Android\\Sdk
+b2c.clientId=00000000-0000-0000-0000-000000000000
+b2c.authority=https://YOUR_TENANT.b2clogin.com/tfp/YOUR_TENANT.onmicrosoft.com/YOUR_SIGN_IN_POLICY/
+b2c.redirectUri=msauth://com.intouch.testapp/YOUR_URL_ENCODED_SIGNATURE_HASH
+b2c.signatureHash=YOUR_RAW_BASE64_SIGNATURE_HASH
+b2c.scopes=https://YOUR_TENANT.onmicrosoft.com/YOUR_API/access_as_user
+firebase.oidcProviderId=oidc.YOUR_PROVIDER_ID
+tokenExchange.url=https://YOUR_BACKEND.example.com/auth/exchange
+userProfile.url=https://YOUR_BACKEND.example.com/user/me

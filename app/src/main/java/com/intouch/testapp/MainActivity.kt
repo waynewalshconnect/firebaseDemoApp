@@ -1,0 +1,425 @@
+package com.intouch.testapp
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
+import com.microsoft.identity.client.AuthenticationCallback
+import com.microsoft.identity.client.IAuthenticationResult
+import com.microsoft.identity.client.IPublicClientApplication
+import com.microsoft.identity.client.ISingleAccountPublicClientApplication
+import com.microsoft.identity.client.PublicClientApplication
+import com.microsoft.identity.client.SignInParameters
+import com.microsoft.identity.client.exception.MsalException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+private enum class FlowStep { B2C, EXCHANGE, PROFILE }
+
+private data class UserProfile(
+    val guestId: String,
+    val email: String,
+    val firstName: String,
+    val lastName: String,
+)
+
+private data class AppState(
+    val message: String = "Ready to authenticate",
+    val b2cComplete: Boolean = false,
+    val exchangeComplete: Boolean = false,
+    val exchangeDetail: String? = null,
+    val profile: UserProfile? = null,
+    val activeStep: FlowStep? = null,
+    val failedStep: FlowStep? = null,
+)
+
+class MainActivity : ComponentActivity() {
+    private var state by mutableStateOf(AppState())
+    private var b2cApplication: ISingleAccountPublicClientApplication? = null
+    private var b2cAccessToken: String? = null
+    private var elevateAccessToken: String? = null
+    private var b2cProfile: UserProfile? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { DemoApp(state, ::signIn, ::exchangeToken, ::loadProfile, ::signOut) }
+        initializeB2c()
+    }
+
+    private fun initializeB2c() {
+        if (listOf(BuildConfig.B2C_CLIENT_ID, BuildConfig.B2C_AUTHORITY, BuildConfig.B2C_REDIRECT_URI).any(String::isBlank)) {
+            state = AppState(message = "Add the B2C values to local.properties, then rebuild", failedStep = FlowStep.B2C)
+            return
+        }
+
+        PublicClientApplication.createSingleAccountPublicClientApplication(
+            this,
+            R.raw.msal_config,
+            object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
+                override fun onCreated(application: ISingleAccountPublicClientApplication) {
+                    b2cApplication = application
+                    state = AppState()
+                }
+
+                override fun onError(exception: MsalException) {
+                    state = state.copy(
+                        message = exception.message ?: "Unable to initialize B2C",
+                        activeStep = null,
+                        failedStep = FlowStep.B2C,
+                    )
+                }
+            },
+        )
+    }
+
+    private fun signIn() {
+        val application = b2cApplication ?: return
+        val scopes = BuildConfig.B2C_SCOPES.split(',', ' ').filter(String::isNotBlank)
+        if (scopes.isEmpty() || BuildConfig.TOKEN_EXCHANGE_URL.isBlank() || BuildConfig.USER_PROFILE_URL.isBlank()) {
+            state = AppState(
+                message = "Add the B2C scope, exchange URL, and profile URL to local.properties",
+                failedStep = FlowStep.B2C,
+            )
+            return
+        }
+
+        state = AppState(message = "Signing in with Microsoft Entra B2C", activeStep = FlowStep.B2C)
+        application.signIn(
+            SignInParameters.builder()
+                .withActivity(this)
+                .withScopes(scopes)
+                .withCallback(object : AuthenticationCallback {
+                    override fun onSuccess(authenticationResult: IAuthenticationResult) {
+                        b2cAccessToken = authenticationResult.accessToken
+                        elevateAccessToken = null
+                        b2cProfile = userProfileFromClaims(
+                            authenticationResult.account.claims.orEmpty(),
+                            authenticationResult.account.username,
+                        )
+                        state = AppState(message = "B2C authentication complete", b2cComplete = true)
+                    }
+
+                    override fun onError(exception: MsalException) {
+                        state = AppState(
+                            message = exception.message ?: "B2C authentication failed",
+                            failedStep = FlowStep.B2C,
+                        )
+                    }
+
+                    override fun onCancel() {
+                        state = AppState(message = "Sign-in cancelled")
+                    }
+                })
+                .build(),
+        )
+    }
+
+    private fun exchangeToken() {
+        val accessToken = b2cAccessToken ?: run {
+            state = state.copy(message = "Complete B2C authentication first", failedStep = FlowStep.B2C)
+            return
+        }
+        if (state.profile == null) {
+            state = state.copy(message = "Verify the B2C user profile first", failedStep = FlowStep.PROFILE)
+            return
+        }
+        lifecycleScope.launch {
+            runCatching {
+                state = state.copy(
+                    message = "Exchanging the B2C token on the trusted backend",
+                    exchangeComplete = false,
+                    exchangeDetail = null,
+                    activeStep = FlowStep.EXCHANGE,
+                    failedStep = null,
+                )
+                TokenExchangeClient.exchange(BuildConfig.TOKEN_EXCHANGE_URL, accessToken)
+            }.onSuccess { result ->
+                elevateAccessToken = result.accessToken
+                state = state.copy(
+                    message = "Elevate token exchange complete",
+                    exchangeComplete = true,
+                    exchangeDetail = "${result.tokenType} token, expires in ${result.expiresIn} seconds",
+                    activeStep = null,
+                )
+            }.onFailure { error ->
+                elevateAccessToken = null
+                state = state.copy(
+                    message = error.message ?: "Token exchange failed",
+                    activeStep = null,
+                    failedStep = FlowStep.EXCHANGE,
+                )
+            }
+        }
+    }
+
+    private fun loadProfile() {
+        if (b2cAccessToken == null) {
+            state = state.copy(message = "Complete B2C authentication first", failedStep = FlowStep.B2C)
+            return
+        }
+        val profile = b2cProfile
+        if (profile == null || (profile.email.isBlank() && profile.guestId.isBlank())) {
+            state = state.copy(message = "B2C token contains no usable user identity", failedStep = FlowStep.PROFILE)
+            return
+        }
+        state = state.copy(
+            message = "B2C user identity verified",
+            profile = profile,
+            activeStep = null,
+            failedStep = null,
+        )
+    }
+
+    private fun signOut() {
+        b2cApplication?.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
+            override fun onSignOut() {
+                b2cAccessToken = null
+                elevateAccessToken = null
+                b2cProfile = null
+                state = AppState(message = "Signed out")
+            }
+
+            override fun onError(exception: MsalException) {
+                state = state.copy(message = exception.message ?: "B2C sign-out failed")
+            }
+        })
+    }
+}
+
+private fun userProfileFromClaims(claims: Map<String, *>, username: String?): UserProfile {
+    fun claim(vararg names: String): String = names.firstNotNullOfOrNull { name ->
+        when (val value = claims[name]) {
+            is String -> value.takeIf(String::isNotBlank)
+            is Collection<*> -> value.firstOrNull()?.toString()?.takeIf(String::isNotBlank)
+            else -> value?.toString()?.takeIf(String::isNotBlank)
+        }
+    }.orEmpty()
+
+    return UserProfile(
+        guestId = claim("oid", "sub"),
+        email = claim("email", "emails", "preferred_username").ifBlank { username.orEmpty() },
+        firstName = claim("given_name"),
+        lastName = claim("family_name"),
+    )
+}
+
+private data class TokenExchangeResult(
+    val accessToken: String,
+    val tokenType: String,
+    val expiresIn: Long,
+)
+
+private object TokenExchangeClient {
+    suspend fun exchange(endpoint: String, accessToken: String): TokenExchangeResult = withContext(Dispatchers.IO) {
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 15_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.outputStream.bufferedWriter().use {
+                it.write(JSONObject().put("b2CToken", accessToken).toString())
+            }
+            val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (connection.responseCode !in 200..299) {
+                val problem = runCatching { JSONObject(body).optString("detail") }.getOrNull()
+                error(problem?.takeIf(String::isNotBlank) ?: "Token exchange returned HTTP ${connection.responseCode}")
+            }
+            val response = JSONObject(body)
+            check(response.optString("accessToken").isNotBlank()) { "Exchange response is missing accessToken" }
+            check(response.optString("refreshToken").isNotBlank()) { "Exchange response is missing refreshToken" }
+            TokenExchangeResult(
+                accessToken = response.getString("accessToken"),
+                tokenType = response.optString("tokenType", "Bearer"),
+                expiresIn = response.optLong("expiresIn"),
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+private object UserProfileClient {
+    suspend fun getCurrentUser(endpoint: String, accessToken: String): UserProfile = withContext(Dispatchers.IO) {
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 15_000
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Authorization", "Bearer $accessToken")
+
+            val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (connection.responseCode !in 200..299) {
+                val problem = runCatching { JSONObject(body).optString("detail") }.getOrNull()
+                error(problem?.takeIf(String::isNotBlank) ?: "User profile returned HTTP ${connection.responseCode}")
+            }
+            val response = JSONObject(body)
+            UserProfile(
+                guestId = response.optString("guestId"),
+                email = response.optString("email"),
+                firstName = response.optString("firstName"),
+                lastName = response.optString("lastName"),
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+@Composable
+private fun DemoApp(
+    state: AppState,
+    onSignIn: () -> Unit,
+    onExchangeToken: () -> Unit,
+    onLoadProfile: () -> Unit,
+    onSignOut: () -> Unit,
+) {
+    val busy = state.activeStep != null
+    val colors = lightColorScheme(
+        primary = Color(0xFF006B5B),
+        surface = Color(0xFFF7F8F3),
+        onSurface = Color(0xFF18201D),
+        error = Color(0xFFB42318),
+    )
+    MaterialTheme(colorScheme = colors) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 40.dp),
+                verticalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column {
+                    Text("INTOUCH LAB", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Spacer(Modifier.height(16.dp))
+                    Text("B2C to Elevate", fontWeight = FontWeight.Bold, fontSize = 34.sp, letterSpacing = 0.sp)
+                    Text("Secure token exchange demo", color = Color(0xFF58635F), fontSize = 18.sp)
+                }
+
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    val b2cStatus = when {
+                        state.activeStep == FlowStep.B2C -> "Authentication in progress"
+                        state.failedStep == FlowStep.B2C -> "Failed: ${state.message}"
+                        state.b2cComplete -> "Authenticated; B2C access token received"
+                        else -> "Ready"
+                    }
+                    val profileStatus = state.profile?.let { profile ->
+                        val name = listOf(profile.firstName, profile.lastName)
+                            .filter(String::isNotBlank)
+                            .joinToString(" ")
+                        listOf(
+                            name.takeIf(String::isNotBlank)?.let { "Name: $it" },
+                            profile.email.takeIf(String::isNotBlank)?.let { "Email: $it" },
+                            profile.guestId.takeIf(String::isNotBlank)?.let { "Guest ID: $it" },
+                        ).filterNotNull().joinToString("\n")
+                    } ?: when {
+                        state.activeStep == FlowStep.PROFILE -> "Loading profile"
+                        state.failedStep == FlowStep.PROFILE -> "Failed: ${state.message}"
+                        state.failedStep == FlowStep.EXCHANGE -> "Blocked: token exchange failed"
+                        !state.exchangeComplete -> "Locked until token exchange"
+                        else -> "Ready to load profile"
+                    }
+                    val exchangeStatus = when {
+                        state.activeStep == FlowStep.EXCHANGE -> "Exchanging B2C token"
+                        state.failedStep == FlowStep.EXCHANGE -> "Failed: ${state.message}"
+                        state.exchangeComplete -> state.exchangeDetail ?: "Exchange complete"
+                        !state.b2cComplete -> "Locked until B2C authentication"
+                        else -> "Ready to exchange token"
+                    }
+
+                    StepRow("1", "Microsoft Entra B2C", b2cStatus, state.b2cComplete || state.activeStep == FlowStep.B2C, !busy, onSignIn)
+                    StepRow("2", "Current user profile", profileStatus, state.profile != null || state.activeStep == FlowStep.PROFILE, state.b2cComplete && !busy, onLoadProfile)
+                    StepRow("3", "Elevate token exchange", exchangeStatus, state.exchangeComplete || state.activeStep == FlowStep.EXCHANGE, state.b2cComplete && !busy, onExchangeToken)
+                    Spacer(Modifier.height(24.dp))
+                    Box(
+                        modifier = Modifier.fillMaxWidth()
+                            .background(Color(0xFFE8ECE7), RoundedCornerShape(6.dp)).padding(16.dp),
+                    ) {
+                        Column {
+                            Text(
+                                state.message,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (state.failedStep != null) colors.error else colors.onSurface,
+                            )
+                        }
+                    }
+                }
+
+                if (state.b2cComplete) {
+                    Button(
+                        onClick = onSignOut,
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth().height(54.dp),
+                        shape = RoundedCornerShape(6.dp),
+                    ) {
+                        Text("Sign out", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StepRow(
+    number: String,
+    label: String,
+    status: String,
+    active: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Box(
+            modifier = Modifier.background(
+                if (active) Color(0xFF006B5B) else Color(0xFFD8DEDA),
+                RoundedCornerShape(4.dp),
+            ).padding(horizontal = 10.dp, vertical = 6.dp),
+        ) {
+            Text(number, color = if (active) Color.White else Color(0xFF58635F), fontWeight = FontWeight.Bold)
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, fontWeight = FontWeight.Medium)
+            Text(status, color = Color(0xFF58635F), fontSize = 13.sp)
+        }
+    }
+}
