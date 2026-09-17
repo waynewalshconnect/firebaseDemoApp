@@ -1,6 +1,7 @@
 package com.intouch.testapp
 
 import android.os.Bundle
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -32,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.microsoft.identity.client.AuthenticationCallback
+import com.microsoft.identity.client.IAccount
 import com.microsoft.identity.client.IAuthenticationResult
 import com.microsoft.identity.client.IPublicClientApplication
 import com.microsoft.identity.client.ISingleAccountPublicClientApplication
@@ -66,6 +68,7 @@ private data class AppState(
 
 class MainActivity : ComponentActivity() {
     private var state by mutableStateOf(AppState())
+    private var authenticated by mutableStateOf(false)
     private var b2cApplication: ISingleAccountPublicClientApplication? = null
     private var b2cAccessToken: String? = null
     private var elevateAccessToken: String? = null
@@ -73,7 +76,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { DemoApp(state, ::signIn, ::exchangeToken, ::loadProfile, ::signOut) }
+        setContent { DemoApp(state, authenticated, ::signIn, ::exchangeToken, ::loadProfile, ::signOut) }
         initializeB2c()
     }
 
@@ -89,6 +92,17 @@ class MainActivity : ComponentActivity() {
             object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
                 override fun onCreated(application: ISingleAccountPublicClientApplication) {
                     b2cApplication = application
+                    application.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
+                        override fun onAccountLoaded(activeAccount: IAccount?) {
+                            authenticated = activeAccount != null
+                        }
+
+                        override fun onAccountChanged(priorAccount: IAccount?, currentAccount: IAccount?) {
+                            authenticated = currentAccount != null
+                        }
+
+                        override fun onError(exception: MsalException) = Unit
+                    })
                     state = AppState()
                 }
 
@@ -127,7 +141,11 @@ class MainActivity : ComponentActivity() {
                             authenticationResult.account.claims.orEmpty(),
                             authenticationResult.account.username,
                         )
-                        state = AppState(message = "B2C authentication complete", b2cComplete = true)
+                        authenticated = true
+                        state = AppState(
+                            message = "B2C authentication complete\n${decodedTokenClaims(authenticationResult.accessToken)}",
+                            b2cComplete = true,
+                        )
                     }
 
                     override fun onError(exception: MsalException) {
@@ -148,10 +166,6 @@ class MainActivity : ComponentActivity() {
     private fun exchangeToken() {
         val accessToken = b2cAccessToken ?: run {
             state = state.copy(message = "Complete B2C authentication first", failedStep = FlowStep.B2C)
-            return
-        }
-        if (state.profile == null) {
-            state = state.copy(message = "Verify the B2C user profile first", failedStep = FlowStep.PROFILE)
             return
         }
         lifecycleScope.launch {
@@ -207,6 +221,7 @@ class MainActivity : ComponentActivity() {
                 b2cAccessToken = null
                 elevateAccessToken = null
                 b2cProfile = null
+                authenticated = false
                 state = AppState(message = "Signed out")
             }
 
@@ -304,6 +319,7 @@ private object UserProfileClient {
 @Composable
 private fun DemoApp(
     state: AppState,
+    authenticated: Boolean,
     onSignIn: () -> Unit,
     onExchangeToken: () -> Unit,
     onLoadProfile: () -> Unit,
@@ -348,7 +364,6 @@ private fun DemoApp(
                     } ?: when {
                         state.activeStep == FlowStep.PROFILE -> "Loading profile"
                         state.failedStep == FlowStep.PROFILE -> "Failed: ${state.message}"
-                        state.failedStep == FlowStep.EXCHANGE -> "Blocked: token exchange failed"
                         !state.exchangeComplete -> "Locked until token exchange"
                         else -> "Ready to load profile"
                     }
@@ -361,8 +376,8 @@ private fun DemoApp(
                     }
 
                     StepRow("1", "Microsoft Entra B2C", b2cStatus, state.b2cComplete || state.activeStep == FlowStep.B2C, !busy, onSignIn)
-                    StepRow("2", "Current user profile", profileStatus, state.profile != null || state.activeStep == FlowStep.PROFILE, state.b2cComplete && !busy, onLoadProfile)
-                    StepRow("3", "Elevate token exchange", exchangeStatus, state.exchangeComplete || state.activeStep == FlowStep.EXCHANGE, state.b2cComplete && !busy, onExchangeToken)
+                    StepRow("2", "Elevate token exchange", exchangeStatus, state.exchangeComplete || state.activeStep == FlowStep.EXCHANGE, state.b2cComplete && !busy, onExchangeToken)
+                    StepRow("3", "Current user profile", profileStatus, state.profile != null || state.activeStep == FlowStep.PROFILE, state.exchangeComplete && !busy, onLoadProfile)
                     Spacer(Modifier.height(24.dp))
                     Box(
                         modifier = Modifier.fillMaxWidth()
@@ -378,7 +393,7 @@ private fun DemoApp(
                     }
                 }
 
-                if (state.b2cComplete) {
+                if (authenticated) {
                     Button(
                         onClick = onSignOut,
                         enabled = !busy,
@@ -422,4 +437,25 @@ private fun StepRow(
             Text(status, color = Color(0xFF58635F), fontSize = 13.sp)
         }
     }
+}
+
+private fun decodedTokenClaims(token: String): String {
+    val payload = token.split('.').getOrNull(1)
+        ?: return "Token claims unavailable"
+    val claims = runCatching {
+        val bytes = Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        JSONObject(String(bytes, Charsets.UTF_8))
+    }.getOrNull() ?: return "Token claims unavailable"
+    val expiry = claims.optLong("exp")
+    val expiryText = if (expiry > 0) java.time.Instant.ofEpochSecond(expiry).toString() else "missing"
+    return listOf(
+        "Token claims (decoded locally; not signature-verified):",
+        "iss=${claims.optString("iss", "missing")}",
+        "aud=${claims.opt("aud")?.toString() ?: "missing"}",
+        "sub=${claims.optString("sub", "missing")}",
+        "oid=${claims.optString("oid", "missing")}",
+        "policy=${claims.optString("tfp").ifBlank { claims.optString("acr", "missing") }}",
+        "scp=${claims.optString("scp", "missing")}",
+        "exp=$expiryText",
+    ).joinToString("\n")
 }
