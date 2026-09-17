@@ -424,7 +424,6 @@ private fun DemoApp(
     authenticated: Boolean,
     authMode: AuthMode,
     onAuthModeSelected: (AuthMode) -> Unit,
->>>>>>> 9fca1cb (Add Firebase OIDC sign-in mode)
     onSignIn: () -> Unit,
     onExchangeToken: () -> Unit,
     onLoadProfile: () -> Unit,
