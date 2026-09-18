@@ -84,6 +84,7 @@ class MainActivity : ComponentActivity() {
     private var b2cApplication: ISingleAccountPublicClientApplication? = null
     private val firebaseAuth by lazy { FirebaseAuth.getInstance() }
     private var b2cAccessToken: String? = null
+    private var exchangeToken: String? = null
     private var elevateAccessToken: String? = null
     private var b2cProfile: UserProfile? = null
 
@@ -179,6 +180,7 @@ class MainActivity : ComponentActivity() {
                 .withCallback(object : AuthenticationCallback {
                     override fun onSuccess(authenticationResult: IAuthenticationResult) {
                         b2cAccessToken = authenticationResult.accessToken
+                        exchangeToken = authenticationResult.accessToken
                         elevateAccessToken = null
                         b2cProfile = userProfileFromClaims(
                             authenticationResult.account.claims.orEmpty(),
@@ -211,7 +213,7 @@ class MainActivity : ComponentActivity() {
             state = AppState(message = "Add the Firebase OIDC provider ID to local.properties", failedStep = FlowStep.B2C)
             return
         }
-        val scopes = BuildConfig.B2C_SCOPES.split(',', ' ').filter(String::isNotBlank)
+        val scopes = listOf("openid")
         val provider = OAuthProvider.newBuilder(BuildConfig.FIREBASE_OIDC_PROVIDER_ID).apply {
             this.scopes = scopes
         }.build()
@@ -240,25 +242,30 @@ class MainActivity : ComponentActivity() {
 
     private fun completeFirebaseSignIn(result: AuthResult) {
         val credential = result.credential as? OAuthCredential
+        val idToken = credential?.idToken
         val accessToken = credential?.accessToken
-        if (accessToken.isNullOrBlank()) {
+        if (idToken.isNullOrBlank()) {
             state = AppState(
-                message = "Firebase OIDC returned no B2C access token",
+                message = "Firebase OIDC returned no B2C ID token",
                 failedStep = FlowStep.B2C,
             )
             return
         }
         val user = result.user
         val claims = result.additionalUserInfo?.profile.orEmpty()
-        b2cAccessToken = accessToken
+        b2cAccessToken = accessToken ?: idToken
+        exchangeToken = idToken
         elevateAccessToken = null
         b2cProfile = userProfileFromClaims(claims, user?.email ?: user?.displayName)
         state = AppState(message = "Firebase OIDC authentication complete", b2cComplete = true)
     }
 
     private fun exchangeToken() {
-        val accessToken = b2cAccessToken ?: run {
-            state = state.copy(message = "Complete B2C authentication first", failedStep = FlowStep.B2C)
+        val accessToken = exchangeToken ?: run {
+            state = state.copy(
+                message = "Sign in again to refresh the B2C token before exchanging",
+                failedStep = FlowStep.B2C,
+            )
             return
         }
         lifecycleScope.launch {
@@ -310,26 +317,23 @@ class MainActivity : ComponentActivity() {
 
     private fun signOut() {
         firebaseAuth.signOut()
-        if (authMode == AuthMode.FIREBASE_OIDC) {
+        val clearLocalState = {
             b2cAccessToken = null
+            exchangeToken = null
             elevateAccessToken = null
             b2cProfile = null
+            authenticated = false
             state = AppState(message = "Signed out")
-            return
         }
         b2cApplication?.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
             override fun onSignOut() {
-                b2cAccessToken = null
-                elevateAccessToken = null
-                b2cProfile = null
-                authenticated = false
-                state = AppState(message = "Signed out")
+                clearLocalState()
             }
 
             override fun onError(exception: MsalException) {
-                state = state.copy(message = exception.message ?: "B2C sign-out failed")
+                clearLocalState()
             }
-        })
+        }) ?: clearLocalState()
     }
 }
 

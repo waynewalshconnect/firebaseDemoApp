@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `b2c-ci` exchange API must support both client paths used by the application:
+The Elevate Integration API must support both client paths used by the application:
 
 1. Direct Android MSAL, which sends a B2C access token.
 2. The browser/Firebase OIDC path, which sends the upstream B2C ID token.
@@ -24,7 +24,7 @@ Do not use the Elevate `guestId` as an input supplied by the mobile client. The 
 The Android and browser clients call:
 
 ```http
-POST https://apim-shared-anz-nonprod.azure-api.net/b2c-ci/v1/auth/exchange
+POST https://<integration-api-host>/v1/auth/exchange
 Content-Type: application/json
 ```
 
@@ -53,7 +53,7 @@ A successful response has the existing Elevate token contract:
 The client uses the returned Elevate access token for:
 
 ```http
-GET /b2c-ci/v1/user/me
+GET /v1/user/me
 Authorization: Bearer <Elevate access token>
 ```
 
@@ -64,8 +64,8 @@ Authorization: Bearer <Elevate access token>
 The Android MSAL path currently sends an access token with the expected values:
 
 ```text
-iss: https://intouchelevateidentitydev.b2clogin.com/599403e0-fde4-482d-8206-b5565ae9909e/v2.0/
-aud: 249bc6ab-e363-4c94-b10d-5eb675922354
+iss: https://<b2c-issuer-base>/v2.0/
+aud: <b2c-client-id>
 sub: <test-user-subject>
 ```
 
@@ -76,10 +76,10 @@ The access token may not contain `acr`, `tfp`, or `scp`. Their absence must not 
 The working browser harness sends the B2C ID token. Its claims include:
 
 ```text
-iss: https://intouchelevateidentitydev.b2clogin.com/599403e0-fde4-482d-8206-b5565ae9909e/v2.0/
-aud: 249bc6ab-e363-4c94-b10d-5eb675922354
+iss: https://<b2c-issuer-base>/v2.0/
+aud: <b2c-client-id>
 sub: <test-user-subject>
-acr: b2c_1a_ci_signup_signin
+acr: <b2c-policy-name>
 email: <test-user@example.com>
 ```
 
@@ -93,14 +93,14 @@ Implement the exchange service in this order:
 2. Reject an empty value with HTTP `400`.
 3. Parse the JWT header and claims only to select a validation profile. Do not trust the claims yet.
 4. Select the CI B2C issuer configuration:
-   - Tenant: `intouchelevateidentitydev`
-   - Policy: `b2c_1a_ci_signup_signin`
+   - Tenant: `<b2c-tenant-name>`
+   - Policy: `<b2c-policy-name>`
    - Discovery metadata: the policy's OIDC discovery document
    - JWKS URI: the `jwks_uri` from that document
 5. Validate the JWT signature using the current JWKS keys and allow normal signing-key rotation.
 6. Validate these required claims for both token types:
    - `iss` equals the configured canonical issuer.
-   - `aud` equals `249bc6ab-e363-4c94-b10d-5eb675922354`.
+   - `aud` equals `<b2c-client-id>`.
    - `exp` is in the future.
    - `nbf`, when present, is not in the future beyond the configured clock-skew allowance.
    - `sub` is present and non-empty.
@@ -137,8 +137,8 @@ For the known CI test user, the mapping should include:
 
 ```text
 environment: CI
-issuer: https://intouchelevateidentitydev.b2clogin.com/599403e0-fde4-482d-8206-b5565ae9909e/v2.0/
-client_audience: 249bc6ab-e363-4c94-b10d-5eb675922354
+issuer: https://<b2c-issuer-base>/v2.0/
+client_audience: <b2c-client-id>
 b2c_subject: <test-user-subject>
 normalized_email: <test-user@example.com>
 elevate_guest_id: <elevate-guest-id>
