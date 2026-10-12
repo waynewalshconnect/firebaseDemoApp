@@ -8,7 +8,7 @@ The supplied Firebase file configures the Android Firebase SDK, but contains no 
 ## Flow
 
 1. Android signs in with Microsoft Entra B2C using MSAL and obtains an API access token.
-2. Android posts `{ "b2CToken": "..." }` to `tokenExchange.url` over HTTPS.
+2. Android posts `{ "b2CToken": "..." }` to the selected environment's `tokenExchange.url` over HTTPS.
 3. The backend validates the token issuer, audience, signature, expiry, policy, and required claims.
 4. The backend returns Elevate `accessToken`, `refreshToken`, `tokenType`, and expiry values.
 
@@ -16,9 +16,11 @@ The active CI operation is `POST https://apim-shared-anz-nonprod.azure-api.net/b
 
 ## Configure
 
-Copy `local.properties.example` to `local.properties`, retain the local `sdk.dir`, and replace every B2C/backend placeholder. Register the exact `b2c.redirectUri` as an Android redirect URI in the Entra app registration. The redirect URI uses the URL-encoded signature hash; `b2c.signatureHash` uses the raw Base64 hash for Android intent matching.
+Copy `local.properties.example` to `local.properties`, retain the local `sdk.dir`, and fill in the environment-specific settings. `app.environment=CI` is the active environment; the app reads all authentication and API values from the matching `ci.*` keys. To switch environments, set `app.environment=UAT` after filling in every `uat.*` value. The build fails with a list of missing properties rather than mixing environment settings.
 
-This demo uses one B2C registration for both the Android client and its own API. Per Azure AD B2C's own-service token convention, `b2c.scopes` is the application client ID (`249bc6ab-e363-4c94-b10d-5eb675922354`). The configured debug redirect URI is tied to the current machine's `~/.android/debug.keystore`; release builds require their release certificate hash and a separately registered redirect URI.
+Register the exact environment's `b2c.redirectUri` as an Android redirect URI in its Entra app registration. The redirect URI uses the URL-encoded signature hash; `b2c.signatureHash` uses the raw Base64 hash for Android intent matching. Environment changes take effect on the next Gradle build/install.
+
+The CI setup uses one B2C registration for both the Android client and its own API. Per Azure AD B2C's own-service token convention, `ci.b2c.scopes` is the application client ID (`249bc6ab-e363-4c94-b10d-5eb675922354`). The configured debug redirect URI is tied to the current machine's `~/.android/debug.keystore`; release builds require their release certificate hash and a separately registered redirect URI.
 
 The exchange endpoint must verify the B2C access token. The app validates the response fields but does not display or log either returned token.
 
@@ -32,7 +34,7 @@ Add this web redirect URI to the B2C-CI integration app registration in the B2C 
 https://intouchtestapp.firebaseapp.com/__/auth/handler
 ```
 
-The app requests scope `249bc6ab-e363-4c94-b10d-5eb675922354`, which is the existing same-registration B2C resource scope. If the Firebase provider ID differs, update `firebase.oidcProviderId` in `local.properties`.
+The app requests scope `249bc6ab-e363-4c94-b10d-5eb675922354`, which is the existing same-registration B2C resource scope. If the Firebase provider ID differs, update `ci.firebase.oidcProviderId` or `uat.firebase.oidcProviderId` for the selected environment.
 
 ## Build
 

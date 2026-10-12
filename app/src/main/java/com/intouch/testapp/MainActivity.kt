@@ -75,6 +75,7 @@ private data class AppState(
     val profile: UserProfile? = null,
     val activeStep: FlowStep? = null,
     val failedStep: FlowStep? = null,
+    val tokenDiagnostics: String? = null,
 )
 
 class MainActivity : ComponentActivity() {
@@ -190,6 +191,7 @@ class MainActivity : ComponentActivity() {
                         state = AppState(
                             message = "B2C authentication complete\n${decodedTokenClaims(authenticationResult.accessToken)}",
                             b2cComplete = true,
+                            tokenDiagnostics = decodedTokenClaims(authenticationResult.accessToken, "MSAL access token"),
                         )
                     }
 
@@ -242,22 +244,30 @@ class MainActivity : ComponentActivity() {
 
     private fun completeFirebaseSignIn(result: AuthResult) {
         val credential = result.credential as? OAuthCredential
-        val idToken = credential?.idToken
-        val accessToken = credential?.accessToken
-        if (idToken.isNullOrBlank()) {
+        val accessToken = credential?.accessToken?.takeIf(String::isNotBlank)
+        val idToken = credential?.idToken?.takeIf(String::isNotBlank)
+        val upstreamToken = accessToken ?: idToken
+        if (upstreamToken == null) {
             state = AppState(
-                message = "Firebase OIDC returned no B2C ID token",
+                message = "Firebase OIDC returned no B2C token",
                 failedStep = FlowStep.B2C,
             )
             return
         }
         val user = result.user
         val claims = result.additionalUserInfo?.profile.orEmpty()
-        b2cAccessToken = accessToken ?: idToken
-        exchangeToken = idToken
+        b2cAccessToken = upstreamToken
+        exchangeToken = upstreamToken
         elevateAccessToken = null
         b2cProfile = userProfileFromClaims(claims, user?.email ?: user?.displayName)
-        state = AppState(message = "Firebase OIDC authentication complete", b2cComplete = true)
+        state = AppState(
+            message = "Firebase OIDC authentication complete",
+            b2cComplete = true,
+            tokenDiagnostics = decodedTokenClaims(
+                upstreamToken,
+                if (accessToken != null) "Firebase upstream access token" else "Firebase upstream ID token",
+            ),
+        )
     }
 
     private fun exchangeToken() {
@@ -298,21 +308,36 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadProfile() {
-        if (b2cAccessToken == null) {
-            state = state.copy(message = "Complete B2C authentication first", failedStep = FlowStep.B2C)
+        val accessToken = elevateAccessToken
+        if (accessToken == null) {
+            state = state.copy(message = "Exchange the B2C token before loading the profile", failedStep = FlowStep.EXCHANGE)
             return
         }
-        val profile = b2cProfile
-        if (profile == null || (profile.email.isBlank() && profile.guestId.isBlank())) {
-            state = state.copy(message = "B2C token contains no usable user identity", failedStep = FlowStep.PROFILE)
-            return
+        lifecycleScope.launch {
+            state = state.copy(
+                message = "Loading profile from Elevate",
+                profile = null,
+                activeStep = FlowStep.PROFILE,
+                failedStep = null,
+            )
+            runCatching {
+                UserProfileClient.getCurrentUser(BuildConfig.USER_PROFILE_URL, accessToken)
+            }.onSuccess { profile ->
+                state = state.copy(
+                    message = "Elevate profile loaded",
+                    profile = profile,
+                    activeStep = null,
+                    failedStep = null,
+                )
+            }.onFailure { error ->
+                state = state.copy(
+                    message = error.message ?: "Unable to load profile",
+                    profile = null,
+                    activeStep = null,
+                    failedStep = FlowStep.PROFILE,
+                )
+            }
         }
-        state = state.copy(
-            message = "B2C user identity verified",
-            profile = profile,
-            activeStep = null,
-            failedStep = null,
-        )
     }
 
     private fun signOut() {
@@ -354,6 +379,15 @@ private fun userProfileFromClaims(claims: Map<String, *>, username: String?): Us
     )
 }
 
+private fun apiErrorMessage(operation: String, statusCode: Int, body: String): String {
+    val errorBody = runCatching { JSONObject(body) }.getOrNull()
+    val detail = errorBody?.optString("detail").orEmpty()
+        .ifBlank { errorBody?.optString("message").orEmpty() }
+    val traceId = errorBody?.optString("traceId").orEmpty()
+    val message = detail.ifBlank { "$operation returned HTTP $statusCode" }
+    return if (traceId.isBlank()) "$message (HTTP $statusCode)" else "$message (HTTP $statusCode, traceId: $traceId)"
+}
+
 private data class TokenExchangeResult(
     val accessToken: String,
     val tokenType: String,
@@ -372,11 +406,11 @@ private object TokenExchangeClient {
             connection.outputStream.bufferedWriter().use {
                 it.write(JSONObject().put("b2CToken", accessToken).toString())
             }
-            val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)
+            val statusCode = connection.responseCode
+            val body = (if (statusCode in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (connection.responseCode !in 200..299) {
-                val problem = runCatching { JSONObject(body).optString("detail") }.getOrNull()
-                error(problem?.takeIf(String::isNotBlank) ?: "Token exchange returned HTTP ${connection.responseCode}")
+            if (statusCode !in 200..299) {
+                error(apiErrorMessage("Token exchange", statusCode, body))
             }
             val response = JSONObject(body)
             check(response.optString("accessToken").isNotBlank()) { "Exchange response is missing accessToken" }
@@ -402,11 +436,11 @@ private object UserProfileClient {
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Authorization", "Bearer $accessToken")
 
-            val body = (if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream)
+            val statusCode = connection.responseCode
+            val body = (if (statusCode in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (connection.responseCode !in 200..299) {
-                val problem = runCatching { JSONObject(body).optString("detail") }.getOrNull()
-                error(problem?.takeIf(String::isNotBlank) ?: "User profile returned HTTP ${connection.responseCode}")
+            if (statusCode !in 200..299) {
+                error(apiErrorMessage("User profile", statusCode, body))
             }
             val response = JSONObject(body)
             UserProfile(
@@ -451,6 +485,7 @@ private fun DemoApp(
                     Spacer(Modifier.height(16.dp))
                     Text("B2C to Elevate", fontWeight = FontWeight.Bold, fontSize = 34.sp, letterSpacing = 0.sp)
                     Text("Secure token exchange demo", color = Color(0xFF58635F), fontSize = 18.sp)
+                    Text("Environment: ${BuildConfig.APP_ENVIRONMENT}", color = Color(0xFF58635F), fontSize = 13.sp)
                     Spacer(Modifier.height(20.dp))
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         AuthMode.entries.forEachIndexed { index, mode ->
@@ -470,7 +505,7 @@ private fun DemoApp(
                     val b2cStatus = when {
                         state.activeStep == FlowStep.B2C -> "Authentication in progress"
                         state.failedStep == FlowStep.B2C -> "Failed: ${state.message}"
-                        state.b2cComplete -> "Authenticated; B2C access token received"
+                        state.b2cComplete -> "Authentication complete; B2C token received"
                         else -> "Ready"
                     }
                     val profileStatus = state.profile?.let { profile ->
@@ -510,6 +545,12 @@ private fun DemoApp(
                                 fontWeight = FontWeight.SemiBold,
                                 color = if (state.failedStep != null) colors.error else colors.onSurface,
                             )
+                            if (state.failedStep == FlowStep.EXCHANGE) {
+                                state.tokenDiagnostics?.let { diagnostics ->
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(diagnostics, color = colors.onSurface, fontSize = 11.sp)
+                                }
+                            }
                         }
                     }
                 }
@@ -560,7 +601,7 @@ private fun StepRow(
     }
 }
 
-private fun decodedTokenClaims(token: String): String {
+private fun decodedTokenClaims(token: String, tokenType: String = "B2C token"): String {
     val payload = token.split('.').getOrNull(1)
         ?: return "Token claims unavailable"
     val claims = runCatching {
@@ -570,7 +611,7 @@ private fun decodedTokenClaims(token: String): String {
     val expiry = claims.optLong("exp")
     val expiryText = if (expiry > 0) java.time.Instant.ofEpochSecond(expiry).toString() else "missing"
     return listOf(
-        "Token claims (decoded locally; not signature-verified):",
+        "$tokenType claims (decoded locally; not signature-verified):",
         "iss=${claims.optString("iss", "missing")}",
         "aud=${claims.opt("aud")?.toString() ?: "missing"}",
         "sub=${claims.optString("sub", "missing")}",
