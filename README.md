@@ -26,7 +26,7 @@ The exchange endpoint must verify the B2C access token. The app validates the re
 
 ## Firebase generic OIDC mode
 
-Firebase OIDC requires **Authentication with Identity Platform**. In Firebase project `intouchtestapp`, add an OpenID Connect provider with provider ID `oidc.b2c-ci`, client ID `249bc6ab-e363-4c94-b10d-5eb675922354`, and issuer `https://intouchelevateidentitydev.b2clogin.com/intouchelevateidentitydev.onmicrosoft.com/b2c_1a_ci_signup_signin/v2.0`. Prefer authorization code flow; store its client secret only in Firebase Console, never in this Android project. The provider must return the B2C access token because the exchange API consumes it.
+Firebase OIDC requires **Authentication with Identity Platform**. In Firebase project `intouchtestapp`, add an OpenID Connect provider with provider ID `oidc.ci-firebase`, client ID `249bc6ab-e363-4c94-b10d-5eb675922354`, and issuer `https://intouchelevateidentitydev.b2clogin.com/intouchelevateidentitydev.onmicrosoft.com/b2c_1a_ci_signup_signin/v2.0`. Prefer authorization code flow; store its client secret only in Firebase Console, never in this Android project. The provider must return the B2C access token because the exchange API consumes it.
 
 Add this web redirect URI to the B2C-CI integration app registration in the B2C tenant:
 
